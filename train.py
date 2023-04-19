@@ -9,10 +9,13 @@ from functools import partial
 from typing import Tuple
 
 import lightning as L
-from lightning.fabric.strategies import FSDPStrategy
+from lightning.fabric.strategies import FSDPXLAStrategy
 
 import torch
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+from torch_xla.distributed.fsdp.wrap import transformer_auto_wrap_policy
+import torch_xla.core.xla_model as xm
+
 
 import numpy as np
 
@@ -38,37 +41,6 @@ grad_clip = 1.0
 
 # For shakespeare, choose smaller block size than vanilla LLaMA
 block_size = 1024
-
-
-def main() -> None:
-    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
-    strategy = FSDPStrategy(auto_wrap_policy=auto_wrap_policy, activation_checkpointing=Block)
-
-    fabric = L.Fabric(accelerator="cuda", devices=4, precision="bf16-mixed", strategy=strategy)
-    fabric.launch()
-    fabric.seed_everything(1337 + fabric.global_rank)
-
-    if fabric.global_rank == 0:
-        os.makedirs(out_dir, exist_ok=True)
-
-    train_data, val_data = load_datasets()
-
-    config = LLaMAConfig.from_name("7B")
-    config.block_size = block_size
-    config.vocab_size = 100  # from prepare_shakespeare.py
-
-    with fabric.device:
-        model = LLaMA(config)
-
-    # if compile:
-    #     model = torch.compile(model)
-
-    model = fabric.setup_module(model)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2))
-    optimizer = fabric.setup_optimizers(optimizer)
-
-    train(fabric, model, optimizer, train_data, val_data)
 
 
 def train(
@@ -146,7 +118,8 @@ def get_batch(fabric: L.Fabric, data: np.ndarray, block_size: int) -> Tuple[torc
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64)) for i in ix])
-    x, y = fabric.to_device((x.pin_memory(), y.pin_memory()))
+    x = x.to(xm.xla_device())
+    y = y.to(xm.xla_device())
     return x, y
 
 
@@ -154,6 +127,39 @@ def load_datasets(data_dir: str = "data/shakespeare") -> Tuple[np.ndarray, np.nd
     train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
     val_data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
     return train_data, val_data
+
+
+def launch_func(fabric):
+    fabric.seed_everything(1337 + fabric.global_rank)
+
+    if fabric.global_rank == 0:
+        os.makedirs(out_dir, exist_ok=True)
+
+    train_data, val_data = load_datasets()
+    config = LLaMAConfig.from_name("7B")
+    config.block_size = block_size
+    config.vocab_size = 100  # from prepare_shakespeare.py
+
+    with fabric.device:
+        model = LLaMA(config)
+
+    # if compile:
+    #     model = torch.compile(model)
+
+    model = fabric.setup(model)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2))
+    optimizer = fabric.setup_optimizers(optimizer)
+
+    train(fabric, model, optimizer, train_data, val_data)
+
+
+def main() -> None:
+    auto_wrap_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
+    strategy = FSDPXLAStrategy(auto_wrap_policy=auto_wrap_policy)
+
+    fabric = L.Fabric(accelerator="tpu", devices=4, strategy=strategy)
+    fabric.launch(launch_func)
 
 
 if __name__ == "__main__":
